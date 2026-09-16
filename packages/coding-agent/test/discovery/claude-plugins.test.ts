@@ -557,7 +557,7 @@ describe("listClaudePluginRoots", () => {
 
 		const result = await loadCapability<Skill>("skills", { cwd: tempDir });
 
-		expect(result.all.find(skill => skill.name === "omp-demo")?._source.provider).toBe("claude-plugins");
+		expect(result.all.find(skill => skill.name === "omp-demo")?._source.provider).toBe("omp-marketplace");
 		expect(result.all.find(skill => skill.name === "claude-demo")).toBeUndefined();
 	});
 

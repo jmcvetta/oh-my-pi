@@ -1128,24 +1128,57 @@ export function registerPluginCacheInvalidator(invalidator: () => void): void {
 }
 
 /**
- * List all installed Claude Code plugin roots from its active plugin cache and
- * ~/.omp/plugins/installed_plugins.json, plus the nearest project registry when present.
+ * Which registry group {@link listClaudePluginRoots} reads.
  *
- * Results are cached per Claude and OMP config directories, project registry, and canonical active project.
+ * - `"all"` — the union: Claude registry, OMP user/project registries, and
+ *   injected `--plugin-dir` roots, with the whole-plugin-ID replacement
+ *   semantics (OMP entries replace Claude entries for the same plugin ID).
+ *   Used by combined inventories (preload, extension-package dedup) and the
+ *   other legacy providers; independent of global provider switches.
+ * - `"claude"` — Claude registry and its `enabledPlugins` settings only.
+ * - `"omp"` — OMP user/project registries and injected roots only; Claude
+ *   registry and settings files are not read or parsed.
+ */
+export type PluginRootSource = "all" | "claude" | "omp";
+
+/**
+ * List installed marketplace plugin roots, optionally restricted to one
+ * registry source.
+ *
+ * `"all"` (default) reads the Claude Code plugin cache registry,
+ * `~/.omp/plugins/installed_plugins.json`, the nearest project registry, and
+ * injected `--plugin-dir` roots. `"claude"` reads only the Claude registry and
+ * its `enabledPlugins` settings; `"omp"` reads only the OMP user/project
+ * registries plus injected roots. The Claude Code registry and its settings
+ * files are not read or parsed in `"omp"` mode, and vice versa.
+ *
+ * Results are cached per source, Claude and OMP config directories, project
+ * registry, and canonical active project. Cache invalidators clear every
+ * selector variant.
  */
 export async function listClaudePluginRoots(
 	home: string,
 	cwd?: string,
+	source: PluginRootSource = "all",
 ): Promise<{ roots: ClaudePluginRoot[]; warnings: string[] }> {
-	const claudeConfigDir = resolveClaudePaths(home).configDir;
-	const ompRegistryPath = path.join(getPluginsDir(home), "installed_plugins.json");
-	const resolvedProjectPath = cwd ? await resolveActiveProjectRegistryPath(cwd) : null;
+	// Registry reads are gated by the selector before any parse or warning
+	// generation: an unselected registry must contribute neither roots nor
+	// warnings. `resolveClaudePaths`/`getPluginsDir` are pure path math; the
+	// reads they gate are the registry and settings files.
+	const claudeConfigDir = source === "omp" ? null : resolveClaudePaths(home).configDir;
+	const ompRegistryPath = source === "claude" ? null : path.join(getPluginsDir(home), "installed_plugins.json");
+	const resolvedProjectPath = ompRegistryPath !== null && cwd ? await resolveActiveProjectRegistryPath(cwd) : null;
 	const projectRoot = resolvedProjectPath ? path.dirname(path.dirname(path.dirname(resolvedProjectPath))) : cwd;
-	const activeClaudeProjectPath = projectRoot ? await canonicalClaudeProjectPath(projectRoot) : null;
-	const canonicalCwd = cwd ? await canonicalClaudeProjectPath(cwd) : null;
-	const settingsDirs = [...new Set([activeClaudeProjectPath, canonicalCwd].filter((d): d is string => !!d))];
-	const enabledOverrides = await readClaudeEnabledPlugins(claudeConfigDir, settingsDirs);
-	const cacheKey = `${claudeConfigDir}:${ompRegistryPath}:${resolvedProjectPath ?? ""}:${activeClaudeProjectPath ?? ""}:${canonicalCwd ?? ""}:${enabledOverrides.sources.join("|")}`;
+	const activeClaudeProjectPath =
+		claudeConfigDir !== null && projectRoot ? await canonicalClaudeProjectPath(projectRoot) : null;
+	const canonicalCwd = claudeConfigDir !== null && cwd ? await canonicalClaudeProjectPath(cwd) : null;
+	const settingsDirs = claudeConfigDir
+		? [...new Set([activeClaudeProjectPath, canonicalCwd].filter((d): d is string => !!d))]
+		: [];
+	const enabledOverrides = claudeConfigDir
+		? await readClaudeEnabledPlugins(claudeConfigDir, settingsDirs)
+		: { enabled: new Map<string, boolean>(), sources: [] as string[] };
+	const cacheKey = `${source}:${claudeConfigDir ?? ""}:${ompRegistryPath ?? ""}:${resolvedProjectPath ?? ""}:${activeClaudeProjectPath ?? ""}:${canonicalCwd ?? ""}:${enabledOverrides.sources.join("|")}`;
 	const cached = pluginRootsCache.get(cacheKey);
 	if (cached) return cached;
 
@@ -1154,127 +1187,84 @@ export async function listClaudePluginRoots(
 	const projectRoots: ClaudePluginRoot[] = [];
 	const canonicalClaudeProjectPaths = new Map<string, string | null>();
 
-	// ── Claude Code registry ──────────────────────────────────────────────────
-	const registryPath = path.join(claudeConfigDir, "plugins", "installed_plugins.json");
-	const content = await readFile(registryPath);
+	// ── Claude Code registry (selected by "all" and "claude") ─────────────────
+	if (claudeConfigDir !== null) {
+		const registryPath = path.join(claudeConfigDir, "plugins", "installed_plugins.json");
+		const content = await readFile(registryPath);
 
-	if (content) {
-		const registry = parseClaudePluginsRegistry(content);
-		if (!registry) {
-			warnings.push(`Failed to parse Claude Code plugin registry: ${registryPath}`);
-		} else {
-			for (const [pluginId, entries] of Object.entries(registry.plugins)) {
-				if (!Array.isArray(entries) || entries.length === 0) continue;
+		if (content) {
+			const registry = parseClaudePluginsRegistry(content);
+			if (!registry) {
+				warnings.push(`Failed to parse Claude Code plugin registry: ${registryPath}`);
+			} else {
+				for (const [pluginId, entries] of Object.entries(registry.plugins)) {
+					if (!Array.isArray(entries) || entries.length === 0) continue;
 
-				// Parse plugin ID format: "plugin-name@marketplace"
-				const atIndex = pluginId.lastIndexOf("@");
-				if (atIndex === -1) {
-					warnings.push(`Invalid plugin ID format (missing @marketplace): ${pluginId}`);
-					continue;
-				}
-
-				const pluginName = pluginId.slice(0, atIndex);
-				const marketplace = pluginId.slice(atIndex + 1);
-
-				// Process all valid entries, not just the first one.
-				// This handles plugins with multiple installs (different scopes/versions).
-				for (const entry of entries) {
-					if (!entry.installPath || typeof entry.installPath !== "string") {
-						warnings.push(`Plugin ${pluginId} entry has no installPath`);
+					// Parse plugin ID format: "plugin-name@marketplace"
+					const atIndex = pluginId.lastIndexOf("@");
+					if (atIndex === -1) {
+						warnings.push(`Invalid plugin ID format (missing @marketplace): ${pluginId}`);
 						continue;
 					}
-					if (entry.enabled === false) continue;
-					// Claude Code's own on/off switch: `enabledPlugins` in settings.json /
-					// settings.local.json. `false` hides the plugin here even though it is
-					// installed; `true` opts a project-bound install into this project even
-					// when its recorded projectPath is a different directory.
-					const override = enabledOverrides.enabled.get(pluginId);
-					if (override === false) continue;
-					if ((entry.scope === "local" || entry.scope === "project") && override !== true) {
-						if (!entry.projectPath || !activeClaudeProjectPath) continue;
-						let entryProjectPath = canonicalClaudeProjectPaths.get(entry.projectPath);
-						if (entryProjectPath === undefined) {
-							entryProjectPath = await canonicalClaudeProjectPath(entry.projectPath);
-							canonicalClaudeProjectPaths.set(entry.projectPath, entryProjectPath);
-						}
-						if (entryProjectPath !== activeClaudeProjectPath) continue;
-					}
 
-					roots.push({
-						id: pluginId,
-						marketplace,
-						plugin: pluginName,
-						version: entry.version || "unknown",
-						path: entry.installPath,
-						scope: entry.scope === "local" ? "project" : entry.scope || "user",
-						origin: "claude",
-					});
+					const pluginName = pluginId.slice(0, atIndex);
+					const marketplace = pluginId.slice(atIndex + 1);
+
+					// Process all valid entries, not just the first one.
+					// This handles plugins with multiple installs (different scopes/versions).
+					for (const entry of entries) {
+						if (!entry.installPath || typeof entry.installPath !== "string") {
+							warnings.push(`Plugin ${pluginId} entry has no installPath`);
+							continue;
+						}
+						if (entry.enabled === false) continue;
+						// Claude Code's own on/off switch: `enabledPlugins` in settings.json /
+						// settings.local.json. `false` hides the plugin here even though it is
+						// installed; `true` opts a project-bound install into this project even
+						// when its recorded projectPath is a different directory.
+						const override = enabledOverrides.enabled.get(pluginId);
+						if (override === false) continue;
+						if ((entry.scope === "local" || entry.scope === "project") && override !== true) {
+							if (!entry.projectPath || !activeClaudeProjectPath) continue;
+							let entryProjectPath = canonicalClaudeProjectPaths.get(entry.projectPath);
+							if (entryProjectPath === undefined) {
+								entryProjectPath = await canonicalClaudeProjectPath(entry.projectPath);
+								canonicalClaudeProjectPaths.set(entry.projectPath, entryProjectPath);
+							}
+							if (entryProjectPath !== activeClaudeProjectPath) continue;
+						}
+
+						roots.push({
+							id: pluginId,
+							marketplace,
+							plugin: pluginName,
+							version: entry.version || "unknown",
+							path: entry.installPath,
+							scope: entry.scope === "local" ? "project" : entry.scope || "user",
+							origin: "claude",
+						});
+					}
 				}
 			}
 		}
 	}
 
-	// ── OMP installed plugins registry ───────────────────────────────────────
-	// OMP registry is authoritative: its entries replace Claude's entries for the same plugin ID.
+	// ── OMP registries and injected roots (selected by "all" and "omp") ───────
+	// OMP user registry is authoritative in "all" mode: its entries replace Claude's
+	// entries for the same plugin ID. In "omp" mode no Claude entries exist, so the
+	// same replacement loop is a no-op and the block behaves identically.
 	// In production `home` is `os.homedir()`, so `getPluginsDir(home)` resolves to the
 	// same XDG-aware path the marketplace writer uses (reads and writes always agree).
 	// Tests pass a temp dir, which short-circuits the resolver for deterministic isolation.
 	// Computed before the cache lookup because isolated SDK homes select distinct OMP registries.
-	const ompContent = await readFile(ompRegistryPath);
-	if (ompContent) {
-		const ompRegistry = parseClaudePluginsRegistry(ompContent);
-		if (ompRegistry) {
-			for (const [pluginId, entries] of Object.entries(ompRegistry.plugins)) {
-				if (!Array.isArray(entries) || entries.length === 0) continue;
-
-				const atIndex = pluginId.lastIndexOf("@");
-				if (atIndex === -1) {
-					warnings.push(`Invalid plugin ID format (missing @marketplace): ${pluginId}`);
-					continue;
-				}
-				const pluginName = pluginId.slice(0, atIndex);
-				const marketplace = pluginId.slice(atIndex + 1);
-
-				// OMP is authoritative: drop all Claude-sourced entries for this plugin ID
-				const filtered = roots.filter(r => r.id !== pluginId);
-				roots.length = 0;
-				roots.push(...filtered);
-
-				for (const entry of entries) {
-					if (!entry.installPath || typeof entry.installPath !== "string") {
-						warnings.push(`Plugin ${pluginId} entry has no installPath`);
-						continue;
-					}
-					if (entry.enabled === false) continue;
-					// Deduplicate by installPath within same ID
-					if (roots.some(r => r.id === pluginId && r.path === entry.installPath)) continue;
-
-					roots.push({
-						id: pluginId,
-						marketplace,
-						plugin: pluginName,
-						version: entry.version || "unknown",
-						path: entry.installPath,
-						scope: entry.scope === "local" ? "project" : entry.scope || "user",
-						origin: "omp",
-					});
-				}
-			}
-		} else {
-			warnings.push(`Failed to parse OMP plugin registry: ${ompRegistryPath}`);
-		}
-	}
-
-	// ── Project-scoped OMP registry ────────────────────────────────────────
-	// Loaded from the nearest .omp/plugins/installed_plugins.json relative to cwd.
-	// Project entries take precedence over user entries for the same plugin ID.
-	if (resolvedProjectPath) {
-		const projectContent = await readFile(resolvedProjectPath);
-		if (projectContent) {
-			const projectRegistry = parseClaudePluginsRegistry(projectContent);
-			if (projectRegistry) {
-				for (const [pluginId, entries] of Object.entries(projectRegistry.plugins)) {
+	if (ompRegistryPath !== null) {
+		const ompContent = await readFile(ompRegistryPath);
+		if (ompContent) {
+			const ompRegistry = parseClaudePluginsRegistry(ompContent);
+			if (ompRegistry) {
+				for (const [pluginId, entries] of Object.entries(ompRegistry.plugins)) {
 					if (!Array.isArray(entries) || entries.length === 0) continue;
+
 					const atIndex = pluginId.lastIndexOf("@");
 					if (atIndex === -1) {
 						warnings.push(`Invalid plugin ID format (missing @marketplace): ${pluginId}`);
@@ -1282,43 +1272,92 @@ export async function listClaudePluginRoots(
 					}
 					const pluginName = pluginId.slice(0, atIndex);
 					const marketplace = pluginId.slice(atIndex + 1);
+
+					// OMP is authoritative: drop all Claude-sourced entries for this plugin ID
+					const filtered = roots.filter(r => r.id !== pluginId);
+					roots.length = 0;
+					roots.push(...filtered);
+
 					for (const entry of entries) {
 						if (!entry.installPath || typeof entry.installPath !== "string") {
 							warnings.push(`Plugin ${pluginId} entry has no installPath`);
 							continue;
 						}
 						if (entry.enabled === false) continue;
-						projectRoots.push({
+						// Deduplicate by installPath within same ID
+						if (roots.some(r => r.id === pluginId && r.path === entry.installPath)) continue;
+
+						roots.push({
 							id: pluginId,
 							marketplace,
 							plugin: pluginName,
 							version: entry.version || "unknown",
 							path: entry.installPath,
-							scope: "project",
+							scope: entry.scope === "local" ? "project" : entry.scope || "user",
 							origin: "omp",
 						});
 					}
 				}
 			} else {
-				warnings.push(`Failed to parse project plugin registry: ${resolvedProjectPath}`);
+				warnings.push(`Failed to parse OMP plugin registry: ${ompRegistryPath}`);
 			}
 		}
-	}
 
-	// Project entries shadow user entries for the same plugin ID.
-	if (projectRoots.length > 0) {
-		const projectIds = new Set(projectRoots.map(r => r.id));
-		const deduped = roots.filter(r => !projectIds.has(r.id));
-		roots.length = 0;
-		roots.push(...projectRoots, ...deduped);
-	}
+		// ── Project-scoped OMP registry ────────────────────────────────────────
+		// Loaded from the nearest .omp/plugins/installed_plugins.json relative to cwd.
+		// Project entries take precedence over user entries for the same plugin ID.
+		if (resolvedProjectPath) {
+			const projectContent = await readFile(resolvedProjectPath);
+			if (projectContent) {
+				const projectRegistry = parseClaudePluginsRegistry(projectContent);
+				if (projectRegistry) {
+					for (const [pluginId, entries] of Object.entries(projectRegistry.plugins)) {
+						if (!Array.isArray(entries) || entries.length === 0) continue;
+						const atIndex = pluginId.lastIndexOf("@");
+						if (atIndex === -1) {
+							warnings.push(`Invalid plugin ID format (missing @marketplace): ${pluginId}`);
+							continue;
+						}
+						const pluginName = pluginId.slice(0, atIndex);
+						const marketplace = pluginId.slice(atIndex + 1);
+						for (const entry of entries) {
+							if (!entry.installPath || typeof entry.installPath !== "string") {
+								warnings.push(`Plugin ${pluginId} entry has no installPath`);
+								continue;
+							}
+							if (entry.enabled === false) continue;
+							projectRoots.push({
+								id: pluginId,
+								marketplace,
+								plugin: pluginName,
+								version: entry.version || "unknown",
+								path: entry.installPath,
+								scope: "project",
+								origin: "omp",
+							});
+						}
+					}
+				} else {
+					warnings.push(`Failed to parse project plugin registry: ${resolvedProjectPath}`);
+				}
+			}
+		}
 
-	// Merge --plugin-dir roots (highest precedence) on every fresh load
-	if (injectedPluginDirRoots.length > 0) {
-		const injectedIds = new Set(injectedPluginDirRoots.map(r => r.id));
-		const filtered = roots.filter(r => !injectedIds.has(r.id));
-		roots.length = 0;
-		roots.push(...injectedPluginDirRoots, ...filtered);
+		// Project entries shadow user entries for the same plugin ID.
+		if (projectRoots.length > 0) {
+			const projectIds = new Set(projectRoots.map(r => r.id));
+			const deduped = roots.filter(r => !projectIds.has(r.id));
+			roots.length = 0;
+			roots.push(...projectRoots, ...deduped);
+		}
+
+		// Merge --plugin-dir roots (highest precedence) on every fresh load
+		if (injectedPluginDirRoots.length > 0) {
+			const injectedIds = new Set(injectedPluginDirRoots.map(r => r.id));
+			const filtered = roots.filter(r => !injectedIds.has(r.id));
+			roots.length = 0;
+			roots.push(...injectedPluginDirRoots, ...filtered);
+		}
 	}
 
 	const result = { roots, warnings };

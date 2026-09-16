@@ -25,7 +25,7 @@ import { isProviderEnabled, isUserSourceEnabled } from "../capability";
 import type { EffectiveExtensionRoots } from "../capability/types";
 import { findAllNearestProjectConfigDirs, getConfigDirs } from "../config";
 import { pluginUsesClaudeModelDialect } from "../discovery/agent-plugin-format";
-import { listClaudePluginRoots } from "../discovery/helpers";
+import { type ClaudePluginRoot, listClaudePluginRoots } from "../discovery/helpers";
 import { listOmpExtensionRoots } from "../discovery/omp-extension-roots";
 import { loadBundledAgents, parseAgent } from "./agents";
 import type { AgentDefinition, AgentSource } from "./types";
@@ -68,6 +68,30 @@ async function loadAgentsFromDir({ dir, source, ignoreModel }: AgentDirectory): 
 		});
 
 	return (await Promise.all(files)).filter(Boolean) as AgentDefinition[];
+}
+
+/**
+ * Append one marketplace lane's agent directories, project scope before user
+ * scope. `ignoreModel` marks roots whose `model:` frontmatter follows the
+ * Claude dialect and must not be read as OMP selectors.
+ */
+async function appendMarketplaceAgentDirs(
+	orderedDirs: AgentDirectory[],
+	roots: ClaudePluginRoot[],
+	ignoreModel: (root: ClaudePluginRoot) => boolean | Promise<boolean>,
+): Promise<void> {
+	const sorted = [...roots].sort((a, b) => {
+		if (a.scope === b.scope) return 0;
+		return a.scope === "project" ? -1 : 1;
+	});
+	const drops = await Promise.all(sorted.map(root => ignoreModel(root)));
+	sorted.forEach((root, index) => {
+		orderedDirs.push({
+			dir: path.join(root.path, "agents"),
+			source: root.scope === "project" ? "project" : "user",
+			ignoreModel: drops[index],
+		});
+	});
 }
 
 /**
@@ -116,40 +140,26 @@ export async function discoverAgents(
 		orderedDirs.push({ dir: path.join(root.path, "agents"), source: root.level });
 	}
 
-	// Load agents from Claude Code marketplace plugins (respects disabledProviders and opt-in).
-	// User-scope roots whose origin is not the foreign ~/.claude/plugins tree (omp's own
-	// installs and `--plugin-dir` roots) survive the claude-plugins opt-in gate, mirroring
-	// isSourceEnabled in extensibility/skills.ts (#10743). Without this, `--plugin-dir` and
-	// omp-installed agents are dropped at user scope whenever the Claude source is disabled.
-	const claudePluginsUserEnabled = isUserSourceEnabled("claude-plugins") || isUserSourceEnabled("claude");
-	const { roots: pluginRoots } = isProviderEnabled("claude-plugins")
-		? await listClaudePluginRoots(home, resolvedCwd)
-		: { roots: [] };
-	const filteredPluginRoots = pluginRoots.filter(
-		r => r.scope === "project" || claudePluginsUserEnabled || r.origin !== "claude",
-	);
-	const sortedPluginRoots = [...filteredPluginRoots].sort((a, b) => {
-		if (a.scope === b.scope) return 0;
-		return a.scope === "project" ? -1 : 1;
-	});
-	const pluginModelDrops = await Promise.all(
+	// Marketplace plugin agents load through two independently gated lanes.
+	// The OMP lane (OMP registries + --plugin-dir roots) is gated only by the
+	// omp-marketplace whole-provider switch — these are OMP's own installs and
+	// need no foreign opt-in. The Claude lane keeps the claude-plugins
+	// user-source opt-in for user-scope roots; project roots stay available
+	// without it (mirroring allowedRoots in discovery/marketplace-provider.ts).
+	// The OMP lane runs first so equal agent names resolve to OMP bodies.
+	if (isProviderEnabled("omp-marketplace")) {
+		const { roots } = await listClaudePluginRoots(home, resolvedCwd, "omp");
+		await appendMarketplaceAgentDirs(orderedDirs, roots, plugin => pluginUsesClaudeModelDialect(plugin.path));
+	}
+	if (isProviderEnabled("claude-plugins")) {
+		const claudePluginsUserEnabled = isUserSourceEnabled("claude-plugins") || isUserSourceEnabled("claude");
+		const { roots } = await listClaudePluginRoots(home, resolvedCwd, "claude");
+		const scopedRoots = roots.filter(r => r.scope === "project" || claudePluginsUserEnabled);
 		// The `model:` dialect follows the plugin's declared manifest, not the
-		// registry that supplied it: foreign Claude roots (origin "claude") always
-		// use Claude aliases, and an omp-installed or --plugin-dir root can still
-		// ship a `.claude-plugin` package. Claude-dialect frontmatter is dropped so
-		// its aliases are not misread as OMP selectors (#7966); OMP-native and
-		// Agent-Plugins-standard plugin agents keep their selectors (#12028).
-		sortedPluginRoots.map(
-			async plugin => plugin.origin === "claude" || (await pluginUsesClaudeModelDialect(plugin.path)),
-		),
-	);
-	sortedPluginRoots.forEach((plugin, index) => {
-		orderedDirs.push({
-			dir: path.join(plugin.path, "agents"),
-			source: plugin.scope === "project" ? "project" : "user",
-			ignoreModel: pluginModelDrops[index],
-		});
-	});
+		// registry that supplied it (#7966, #12028). Claude-origin roots always
+		// use Claude aliases, so their frontmatter `model:` is dropped.
+		await appendMarketplaceAgentDirs(orderedDirs, scopedRoots, () => true);
+	}
 
 	const seen = new Set<string>();
 	const loadedAgents = (await Promise.all(orderedDirs.map(loadAgentsFromDir))).flat().filter(agent => {

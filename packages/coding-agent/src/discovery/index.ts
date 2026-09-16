@@ -27,6 +27,7 @@ import "./builtin";
 import "./builtin-defaults";
 import "./claude";
 import "./claude-plugins";
+import "./omp-marketplace";
 import "./cline";
 import "./agents";
 import "./codex";

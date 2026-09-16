@@ -3,6 +3,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { discoverAndLoadExtensions } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/loader";
+import { disableProvider, enableProvider } from "@oh-my-pi/pi-coding-agent/capability";
 import { getAgentDir, getPluginsDir, removeSyncWithRetries, setAgentDir, TempDir } from "@oh-my-pi/pi-utils";
 
 const currentPiCodingAgentPath = Bun.resolveSync("@oh-my-pi/pi-coding-agent", import.meta.dir);
@@ -91,6 +92,23 @@ describe("plugin extension discovery", () => {
 		expect(result.errors).toHaveLength(0);
 		expect(extension).toBeDefined();
 		expect(extension?.commands.has("plugin-ext")).toBe(true);
+	});
+
+	it("still registers installed extension module commands when claude-plugins is disabled", async () => {
+		// Extension modules are owned by their own capability lane, not the
+		// legacy marketplace providers; disabling claude-plugins must not hide
+		// the installed module's registered command.
+		disableProvider("claude-plugins");
+		try {
+			const result = await discoverAndLoadExtensions([], projectDir.path());
+			const extension = result.extensions.find(ext => ext.path.endsWith(path.join("dist", "extension.ts")));
+
+			expect(result.errors).toHaveLength(0);
+			expect(extension).toBeDefined();
+			expect(extension?.commands.has("plugin-ext")).toBe(true);
+		} finally {
+			enableProvider("claude-plugins");
+		}
 	});
 
 	it("loads installed legacy Pi plugin extensions from Windows drive-letter paths", async () => {

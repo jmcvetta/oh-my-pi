@@ -16,7 +16,7 @@ import { afterEach, beforeEach, expect, test } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { getCapability, loadCapability } from "@oh-my-pi/pi-coding-agent/capability";
+import { disableProvider, enableProvider, getCapability, loadCapability } from "@oh-my-pi/pi-coding-agent/capability";
 import { clearCache } from "@oh-my-pi/pi-coding-agent/capability/fs";
 import { hookCapability } from "@oh-my-pi/pi-coding-agent/capability/hook";
 import { mcpCapability } from "@oh-my-pi/pi-coding-agent/capability/mcp";
@@ -654,6 +654,43 @@ test("project-scoped installed plugins surface project-level sub-discovery", asy
 	);
 	const found = skills.find(s => s.name === "my-skill" && s.path.includes("my-project-ext"));
 	expect(found?.level).toBe("project");
+});
+
+test("marketplace runtime symlink does not reappear as an extension package when its provider is disabled", async () => {
+	// A marketplace install keeps a runtime symlink under
+	// `<plugins>/node_modules/` for enable-state persistence. Its resources are
+	// owned by the omp-marketplace provider; the combined-root inventory inside
+	// listOmpExtensionRoots stays provider-independent, so disabling that
+	// provider must not let the symlink resurface as an extension package.
+	const pluginsDir = path.join(home, ".omp", "plugins");
+	const installPath = path.join(tempDir, "market-cache", "market-ext");
+	buildExtensionPackage(installPath, "market-skill");
+	writeFile(
+		path.join(pluginsDir, "installed_plugins.json"),
+		JSON.stringify({
+			version: 2,
+			plugins: {
+				"market-ext@market": [
+					{
+						scope: "user",
+						installPath,
+						version: "1.0.0",
+						installedAt: "2026-01-01T00:00:00Z",
+						lastUpdated: "2026-01-01T00:00:00Z",
+					},
+				],
+			},
+		}),
+	);
+	fs.mkdirSync(path.join(pluginsDir, "node_modules"), { recursive: true });
+	fs.symlinkSync(installPath, path.join(pluginsDir, "node_modules", "market-ext"));
+	disableProvider("omp-marketplace");
+	try {
+		const skills = await loadFromPlugin<{ name: string; path: string }>(skillCapability.id, ctx());
+		expect(skills.find(s => s.name === "market-skill" || s.path.includes("market-ext"))).toBeUndefined();
+	} finally {
+		enableProvider("omp-marketplace");
+	}
 });
 
 test("disabled installed plugins do not contribute sub-discovery", async () => {

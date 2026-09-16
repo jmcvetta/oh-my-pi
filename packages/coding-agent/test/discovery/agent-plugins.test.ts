@@ -2,8 +2,9 @@ import { afterEach, beforeEach, describe, expect, test, vi } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import { loadCapability } from "@oh-my-pi/pi-coding-agent/capability";
+import { disableProvider, enableProvider, loadCapability } from "@oh-my-pi/pi-coding-agent/capability";
 import { clearCache as clearFsCache } from "@oh-my-pi/pi-coding-agent/capability/fs";
+import type { SlashCommand } from "@oh-my-pi/pi-coding-agent/capability/slash-command";
 import {
 	AGENT_PLUGIN_MANIFEST_SCHEMA,
 	AGENT_PLUGIN_MCP_SCHEMA,
@@ -13,9 +14,12 @@ import {
 } from "@oh-my-pi/pi-coding-agent/discovery/agent-plugin-format";
 import {
 	clearClaudePluginRootsCache,
+	getPreloadedPluginRoots,
 	injectPluginDirRoots,
 	listClaudePluginRoots,
+	preloadPluginRoots,
 } from "@oh-my-pi/pi-coding-agent/discovery/helpers";
+import "@oh-my-pi/pi-coding-agent/discovery/omp-marketplace";
 import { getPluginsDir, removeWithRetries } from "@oh-my-pi/pi-utils";
 import { restoreEnvValue } from "../helpers/settings-test-state";
 import "@oh-my-pi/pi-coding-agent/discovery/agent-plugins";
@@ -359,6 +363,92 @@ describe("agent-plugins discovery", () => {
 		const api = mcps.all.find(server => server.name === "std-plugin:api");
 		expect(api?.transport).toBe("http");
 		expect(api?.url).toBe("https://deploy.example.com/mcp");
+	});
+
+	test("standard package keeps skills/MCP with agent-plugins while legacy commands ride omp-marketplace", async () => {
+		// The standard package is registered through OMP's own registry, so its
+		// legacy surfaces are owned by omp-marketplace, not claude-plugins.
+		await writeManifest();
+		await writeSkill("deploy", "name: deploy\ndescription: Deploy things");
+		await fs.mkdir(path.join(pluginPath, "bin"), { recursive: true });
+		await fs.writeFile(
+			path.join(pluginPath, "mcp.json"),
+			JSON.stringify({
+				$schema: AGENT_PLUGIN_MCP_SCHEMA,
+				mcpServers: {
+					validator: { type: "stdio", command: "./bin/validator", args: [] },
+				},
+			}),
+		);
+		await fs.mkdir(path.join(pluginPath, "commands"), { recursive: true });
+		await fs.writeFile(path.join(pluginPath, "commands", "deploy-cmd.md"), "Deploy it\n");
+		const ompRegistryPath = path.join(getPluginsDir(tempDir), "installed_plugins.json");
+		await fs.mkdir(path.dirname(ompRegistryPath), { recursive: true });
+		await fs.writeFile(
+			ompRegistryPath,
+			JSON.stringify({
+				version: 2,
+				plugins: {
+					"std-plugin@market": [
+						{
+							scope: "user",
+							installPath: pluginPath,
+							version: "1.0.0",
+							installedAt: "2026-01-01T00:00:00Z",
+							lastUpdated: "2026-01-01T00:00:00Z",
+						},
+					],
+				},
+			}),
+		);
+
+		const skills = await loadCapability<Skill>("skills", { cwd: tempDir });
+		const deploys = skills.all.filter(skill => skill.name === "deploy");
+		expect(deploys).toHaveLength(1);
+		expect(deploys[0]?._source.provider).toBe("agent-plugins");
+
+		const mcps = await loadCapability<MCPServer>("mcps", { cwd: tempDir });
+		const validators = mcps.all.filter(server => server.name === "std-plugin:validator");
+		expect(validators).toHaveLength(1);
+		expect(validators[0]?._source.provider).toBe("agent-plugins");
+
+		const commands = await loadCapability<SlashCommand>("slash-commands", { cwd: tempDir });
+		const cmd = commands.all.find(c => c.name === "std-plugin:deploy-cmd");
+		expect(cmd).toBeDefined();
+		expect(cmd?._source.provider).toBe("omp-marketplace");
+	});
+
+	test("combined preload keeps its inventory with either legacy provider disabled, including an injected root", async () => {
+		await writeManifest();
+		await writeSkill("deploy", "name: deploy\\ndescription: Deploy things");
+		await writeRegistry(pluginPath);
+		const injectedDir = path.join(tempDir, "injected-ext");
+		await fs.mkdir(injectedDir, { recursive: true });
+		await injectPluginDirRoots(tempDir, [injectedDir], tempDir);
+
+		// claude-plugins disabled: the combined inventory (used by LSP/DAP
+		// preload) still lists the OMP-registered root and the injected root.
+		disableProvider("claude-plugins");
+		try {
+			await preloadPluginRoots(tempDir, tempDir);
+			const claudeDisabled = getPreloadedPluginRoots().map(root => root.id);
+			expect(claudeDisabled).toContain("std-plugin@market");
+			expect(claudeDisabled).toContain("injected-ext@__local__");
+		} finally {
+			enableProvider("claude-plugins");
+		}
+
+		// omp-marketplace disabled: the Claude-registered root and injected root
+		// stay in the inventory.
+		disableProvider("omp-marketplace");
+		try {
+			await preloadPluginRoots(tempDir, tempDir);
+			const ompDisabled = getPreloadedPluginRoots().map(root => root.id);
+			expect(ompDisabled).toContain("std-plugin@market");
+			expect(ompDisabled).toContain("injected-ext@__local__");
+		} finally {
+			enableProvider("omp-marketplace");
+		}
 	});
 
 	test("rejects a fatally invalid manifest without discovering any components", async () => {
