@@ -1164,10 +1164,14 @@ export async function listClaudePluginRoots(
 	// Registry reads are gated by the selector before any parse or warning
 	// generation: an unselected registry must contribute neither roots nor
 	// warnings. `resolveClaudePaths`/`getPluginsDir` are pure path math; the
-	// reads they gate are the registry and settings files.
+	// reads they gate are the registry and settings files. The project anchor
+	// walk below stats `.omp/`/`.git` directories only — it parses no registry
+	// — and runs in every mode because Claude project matching and the
+	// `<enabledPlugins>` settings dirs need the canonical repo root even when
+	// the OMP registries are not read.
 	const claudeConfigDir = source === "omp" ? null : resolveClaudePaths(home).configDir;
 	const ompRegistryPath = source === "claude" ? null : path.join(getPluginsDir(home), "installed_plugins.json");
-	const resolvedProjectPath = ompRegistryPath !== null && cwd ? await resolveActiveProjectRegistryPath(cwd) : null;
+	const resolvedProjectPath = cwd ? await resolveActiveProjectRegistryPath(cwd) : null;
 	const projectRoot = resolvedProjectPath ? path.dirname(path.dirname(path.dirname(resolvedProjectPath))) : cwd;
 	const activeClaudeProjectPath =
 		claudeConfigDir !== null && projectRoot ? await canonicalClaudeProjectPath(projectRoot) : null;

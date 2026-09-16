@@ -45,13 +45,39 @@ export interface MarketplaceProviderOptions {
 	id: "claude-plugins" | "omp-marketplace";
 	/** Human-readable provider name shown in provider introspection. */
 	displayName: string;
-	/** One-line provider description shown in provider introspection. */
-	description: string;
 	/** Capability-registry priority; higher wins same-key deduplication. */
 	priority: number;
 	/** Which registry group this provider reads via `listClaudePluginRoots`. */
 	source: "claude" | "omp";
 }
+
+/**
+ * Per-capability provider descriptions, keyed by source. Each of the six
+ * legacy registrations carries a surface-specific description so provider
+ * introspection distinguishes which capability a registration loads; the
+ * pre-split `claude-plugins` wording is preserved verbatim for the
+ * `"claude"` source.
+ */
+type MarketplaceSurface = "skills" | "rules" | "slashCommands" | "hooks" | "tools" | "mcpServers";
+
+const MARKETPLACE_CAPABILITY_DESCRIPTIONS: Record<"claude" | "omp", Record<MarketplaceSurface, string>> = {
+	claude: {
+		skills: "Load skills from Claude Code marketplace plugins (~/.claude/plugins/cache/)",
+		rules: "Load rules from marketplace plugin rules directories",
+		slashCommands: "Load slash commands from Claude Code marketplace plugins",
+		hooks: "Load hooks from Claude Code marketplace plugins",
+		tools: "Load custom tools from Claude Code marketplace plugins",
+		mcpServers: "Load MCP servers from marketplace plugin .mcp.json files",
+	},
+	omp: {
+		skills: "Load skills from OMP marketplace plugins",
+		rules: "Load rules from OMP marketplace plugin rules directories",
+		slashCommands: "Load slash commands from OMP marketplace plugins",
+		hooks: "Load hooks from OMP marketplace plugins",
+		tools: "Load custom tools from OMP marketplace plugins",
+		mcpServers: "Load MCP servers from OMP marketplace plugin .mcp.json files",
+	},
+};
 
 interface ClaudePluginManifest {
 	skills?: string | string[];
@@ -734,11 +760,12 @@ function createMarketplaceLoaders(options: MarketplaceProviderOptions) {
  */
 export function registerMarketplaceProvider(options: MarketplaceProviderOptions): void {
 	const loaders = createMarketplaceLoaders(options);
+	const descriptions = MARKETPLACE_CAPABILITY_DESCRIPTIONS[options.source];
 
 	registerProvider<Skill>(skillCapability.id, {
 		id: options.id,
 		displayName: options.displayName,
-		description: options.description,
+		description: descriptions.skills,
 		priority: options.priority,
 		load: loaders.loadSkills,
 	});
@@ -746,7 +773,7 @@ export function registerMarketplaceProvider(options: MarketplaceProviderOptions)
 	registerProvider<Rule>(ruleCapability.id, {
 		id: options.id,
 		displayName: options.displayName,
-		description: options.description,
+		description: descriptions.rules,
 		priority: options.priority,
 		load: loaders.loadRules,
 	});
@@ -754,7 +781,7 @@ export function registerMarketplaceProvider(options: MarketplaceProviderOptions)
 	registerProvider<SlashCommand>(slashCommandCapability.id, {
 		id: options.id,
 		displayName: options.displayName,
-		description: options.description,
+		description: descriptions.slashCommands,
 		priority: options.priority,
 		load: loaders.loadSlashCommands,
 	});
@@ -762,7 +789,7 @@ export function registerMarketplaceProvider(options: MarketplaceProviderOptions)
 	registerProvider<Hook>(hookCapability.id, {
 		id: options.id,
 		displayName: options.displayName,
-		description: options.description,
+		description: descriptions.hooks,
 		priority: options.priority,
 		load: loaders.loadHooks,
 	});
@@ -770,7 +797,7 @@ export function registerMarketplaceProvider(options: MarketplaceProviderOptions)
 	registerProvider<CustomTool>(toolCapability.id, {
 		id: options.id,
 		displayName: options.displayName,
-		description: options.description,
+		description: descriptions.tools,
 		priority: options.priority,
 		load: loaders.loadTools,
 	});
@@ -778,7 +805,7 @@ export function registerMarketplaceProvider(options: MarketplaceProviderOptions)
 	registerProvider<MCPServer>(mcpCapability.id, {
 		id: options.id,
 		displayName: options.displayName,
-		description: options.description,
+		description: descriptions.mcpServers,
 		priority: options.priority,
 		load: loaders.loadMCPServers,
 	});

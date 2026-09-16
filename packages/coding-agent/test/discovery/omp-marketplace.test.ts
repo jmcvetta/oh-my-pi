@@ -445,7 +445,6 @@ describe("omp-marketplace provider split", () => {
 		writeRegistry(path.join(tempHome, ".claude", "plugins", "installed_plugins.json"), {
 			[CLAUDE_PLUGIN_ID]: [registryEntry(claudeRoot)],
 		});
-		fs.writeFileSync(path.join(tempHome, ".claude", "plugins", "installed_plugins.json"), "{ not json again");
 		fs.writeFileSync(path.join(tempHome, ".omp", "plugins", "installed_plugins.json"), "{ not omp json");
 		clearFsCache();
 		clearClaudePluginRootsCache();
@@ -459,6 +458,9 @@ describe("omp-marketplace provider split", () => {
 
 		// Malformed OMP project registry warns through the omp lane and names the
 		// project registry; valid user entries still load.
+		writeRegistry(path.join(tempHome, ".omp", "plugins", "installed_plugins.json"), {
+			[OMP_PLUGIN_ID]: [registryEntry(ompRoot)],
+		});
 		fs.writeFileSync(path.join(tempProject, ".omp", "plugins", "installed_plugins.json"), "{ broken project");
 		clearFsCache();
 		clearClaudePluginRootsCache();
@@ -471,6 +473,7 @@ describe("omp-marketplace provider split", () => {
 				w => w.includes("project plugin registry") && w.includes(path.join(tempProject, ".omp", "plugins")),
 			),
 		).toBe(true);
+		expect(ompLoad.items.map(s => s.name)).toContain("omp-probe:probe");
 	});
 
 	test("equal capability keys resolve to OMP at priority 71; disabling OMP exposes Claude", async () => {

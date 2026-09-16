@@ -12,7 +12,6 @@ import { registerMarketplaceProvider } from "./marketplace-provider";
 registerMarketplaceProvider({
 	id: "claude-plugins",
 	displayName: "Claude Code Marketplace",
-	description: "Marketplace plugins from the Claude Code registry",
 	priority: 70,
 	source: "claude",
 });

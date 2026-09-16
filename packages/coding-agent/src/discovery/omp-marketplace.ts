@@ -13,7 +13,6 @@ import { registerMarketplaceProvider } from "./marketplace-provider";
 registerMarketplaceProvider({
 	id: "omp-marketplace",
 	displayName: "OMP Marketplace",
-	description: "Marketplace plugins from OMP registries and --plugin-dir",
 	priority: 71,
 	source: "omp",
 });
