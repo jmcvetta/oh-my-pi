@@ -3,7 +3,14 @@ import { isCompiledBinary, logger, withTimeout, workerHostEntry } from "@oh-my-p
 import type { Subprocess } from "bun";
 import type { Browser, CDPSession } from "puppeteer-core";
 import { ToolAbortError, ToolError } from "../tool-errors";
-import { findFreeCdpPort, findReusableCdp, gracefulKillTreeOnce, resolveSpawnArgs, waitForCdp } from "./attach";
+import {
+	findFreeCdpPort,
+	findReusableCdp,
+	gracefulKillTreeOnce,
+	probeCdpAt,
+	resolveSpawnArgs,
+	waitForCdp,
+} from "./attach";
 import type { CmuxKind } from "./cmux/rpc";
 import { CmuxSocketClient } from "./cmux/socket-client";
 import {
@@ -281,8 +288,28 @@ async function openBrowserHandle(kind: BrowserKind, opts: AcquireBrowserOptions)
 		subprocess = child;
 		pid = child.pid;
 		cdpUrl = `http://127.0.0.1:${port}`;
+		// Chromium refuses a second instance on an occupied profile: the new
+		// process performs a singleton handoff and exits at once, and nothing
+		// ever listens on our port. Detect that instead of waiting out the full
+		// CDP timeout, and surface an actionable diagnostic. A short grace
+		// covers launchers whose exec chain briefly passes through an
+		// intermediate process that exits before the real server binds.
+		const exitedWithoutCdp = child.exited.then(async () => {
+			const graceDeadline = Date.now() + 3_000;
+			while (Date.now() < graceDeadline) {
+				if (await probeCdpAt(port, opts.signal)) return;
+				await Bun.sleep(150);
+			}
+			throw new ToolError(
+				`Spawned ${path.basename(exe)} exited without serving CDP on ${cdpUrl}. ` +
+					`Another instance may already be running with this profile; attach to it with app.cdp_url instead of spawning a duplicate.`,
+			);
+		});
+		// Losing the race (CDP came up and waits out the browser's lifetime)
+		// must not surface this rejection as unhandled.
+		exitedWithoutCdp.catch(() => undefined);
 		try {
-			await waitForCdp(cdpUrl, 30_000, opts.signal);
+			await Promise.race([waitForCdp(cdpUrl, 30_000, opts.signal), exitedWithoutCdp]);
 		} catch (err) {
 			await gracefulKillTreeOnce(child.pid).catch(() => undefined);
 			if (err instanceof ToolAbortError) throw err;
