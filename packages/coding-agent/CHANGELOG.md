@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Breaking Changes
+
+- Split OMP marketplace plugin discovery from the Claude Code marketplace: `disabledProviders` now treats `omp-marketplace` (OMP registries and `--plugin-dir` plugins) independently of `claude-plugins` (Claude Code registry). To keep disabling all legacy marketplace plugins, list both provider IDs. ([#1781](https://github.com/can1357/oh-my-pi/issues/1781))
+
 ### Added
 
 - Added `tui.titleSpinner` (`braille` | `dots` | `line`, default `braille`) to pick the terminal-title working-state spinner glyphs alongside the existing `tui.titleState` on/off toggle.

@@ -1,5 +1,6 @@
 import * as net from "node:net";
 import * as path from "node:path";
+import * as fs from "node:fs/promises";
 import { Process, ProcessStatus } from "@oh-my-pi/pi-natives";
 import { getBrowserProfilesDir } from "@oh-my-pi/pi-utils";
 import type { Socket } from "bun";
@@ -230,9 +231,57 @@ function normalizeUserDataDir(userDataDir: string): string {
 }
 
 /** One-shot probe: returns true when `/json/version` answers 200 within the timeout. */
-async function probeCdpAt(port: number, signal?: AbortSignal): Promise<boolean> {
+export async function probeCdpAt(port: number, signal?: AbortSignal): Promise<boolean> {
 	const status = await probeCdpStatus(`http://127.0.0.1:${port}/json/version`, { timeoutMs: 1500, signal });
 	return status !== null && status >= 200 && status < 300;
+}
+
+/**
+ * Linux fallback for `findReusableCdp`: scan `/proc/<pid>/cmdline` for
+ * processes holding `--user-data-dir=<requested>` directly.
+ *
+ * `Process.fromPath` matches `/proc/<pid>/exe` exactly, and on Linux that
+ * symlink always points at the kernel-loaded ELF. Distro Chrome installs
+ * launch through a wrapper (`/usr/bin/google-chrome-stable` is a shell script
+ * that execs `/opt/google/chrome/chrome`), so a browser spawned via that path
+ * is invisible to the exe scan and reuse degrades into a duplicate spawn of
+ * the same profile, whose singleton handoff exits while the attach waits out
+ * its full CDP timeout. The reuse contract is per-profile: match the
+ * `--user-data-dir` argument itself, which argv preserves verbatim.
+ */
+async function findProfileProcesses(requestedUserDataDir: string): Promise<Array<{ pid: number; args: string[] }>> {
+	let entries: string[];
+	try {
+		entries = await fs.readdir("/proc");
+	} catch {
+		return [];
+	}
+	const matches: Array<{ pid: number; args: string[] }> = [];
+	for (const entry of entries) {
+		const pid = Number.parseInt(entry, 10);
+		if (!Number.isInteger(pid) || pid <= 0) continue;
+		let raw: Buffer;
+		try {
+			raw = await fs.readFile(`/proc/${pid}/cmdline`);
+		} catch {
+			continue;
+		}
+		// Chromium rewrites its own cmdline as one space-joined string for the
+		// process title; ordinary processes keep the NUL-separated argv form.
+		// Match both.
+		const nullSeparated = raw
+			.toString("utf8")
+			.split("\0")
+			.filter(arg => arg.length > 0);
+		const args =
+			nullSeparated.length <= 1 && nullSeparated[0]?.includes(" --") ? nullSeparated[0]!.split(" ") : nullSeparated;
+		if (args.length === 0) continue;
+		const profile = findUserDataDirInArgs(args);
+		if (profile === null || !path.isAbsolute(profile)) continue;
+		if (normalizeUserDataDir(profile) !== requestedUserDataDir) continue;
+		matches.push({ pid, args });
+	}
+	return matches;
 }
 
 /**
@@ -249,10 +298,26 @@ export async function findReusableCdp(
 		requestedUserDataDir !== null && path.isAbsolute(requestedUserDataDir)
 			? normalizeUserDataDir(requestedUserDataDir)
 			: null;
-	const candidates = Process.fromPath(exe).filter(process => process.status() === ProcessStatus.Running);
+	const nativeCandidates = Process.fromPath(exe).filter(process => process.status() === ProcessStatus.Running);
 	const candidateArgs: string[][] = [];
+	const seenPids = new Set<number>();
+	for (const process of nativeCandidates) seenPids.add(process.pid);
+	const unified: Array<{ pid: number; args: () => string[] }> = nativeCandidates.map(process => ({
+		pid: process.pid,
+		args: () => process.args(),
+	}));
+	// Distro-wrapper browsers (see `findProfileProcesses`) are invisible to the
+	// exe scan; match them by their requested profile on Linux instead.
+	if (normalizedRequestedUserDataDir !== null && process.platform === "linux") {
+		for (const { pid, args } of await findProfileProcesses(normalizedRequestedUserDataDir)) {
+			if (!seenPids.has(pid)) {
+				seenPids.add(pid);
+				unified.push({ pid, args: () => args });
+			}
+		}
+	}
 	let hasUnreadableCandidate = false;
-	for (const process of candidates) {
+	for (const process of unified) {
 		let args: string[];
 		try {
 			args = process.args();
@@ -288,7 +353,7 @@ export async function findReusableCdp(
 					normalizeUserDataDir(existingUserDataDir) !== normalizedRequestedUserDataDir)
 			);
 		});
-	if (!canLaunchIsolatedProfile && candidates.length > 0) {
+	if (!canLaunchIsolatedProfile && unified.length > 0) {
 		const name = path.basename(exe);
 		throw new ToolError(
 			`Cannot launch ${name} because it is already running without a reusable CDP endpoint. Close ${name}, relaunch it with --remote-debugging-port, or pass app.cdp_url for an existing endpoint.`,
